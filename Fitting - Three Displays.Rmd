@@ -1,0 +1,203 @@
+---
+title: "Fitting Three multistable displays"
+output: html_document
+---
+
+This notebook fits history dependent Gamma distribution data for **Three Displays** data set, either for the original or simulated data (see _Select Set_ chunk). These include binocular rivalry (BR), kinectic-depth effect (KD), and Necker Cube (NC).
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(loo)
+library(MASS)
+library(patchwork)
+library(purrr)
+library(readr)
+library(rstan)
+library(tidyr)
+```
+
+```{r Tabula rasa}
+rm(list = ls())
+```
+
+```{r}
+file <- "3Displays"
+taus <- c(0.9, 30)
+```
+
+## History choice
+
+Select which history to use (`history_to_use` variable). By default, we used "Same" history, _i.e._, history computed for the percept that becomes dominant.
+
+```{r history settings}
+history_to_use <- "Same"
+history_variants <- c("Same", "Other")
+history_to_exclude <- setdiff(history_variants, c(history_to_use))
+```
+
+## Importing data
+
+```{r import}
+reports <- read_csv(fs::path("Data with History", stringr::str_c(file, ".csv")),
+                    col_types = cols(Observer = col_character(),
+                                     Group = col_character(),
+                                     State = col_double(),
+                                     Time = col_double(),
+                                     Duration = col_double(),
+                                     HistorySame = col_double(),
+                                     HistoryOther = col_double(),
+                                     Tau = col_double())) %>%
+  
+  filter(Tau %in% taus) %>%
+  dplyr::select(-one_of(stringr::str_c("History", history_to_exclude))) %>%
+  dplyr::rename(History = !!stringr::str_c("History", history_to_use))
+
+# inverting same history, so that larger values mean lower adaptation levels
+if (history_to_use == "Same")
+  reports$History <- 1 - reports$History
+
+# centering history based on its median value
+reports <-
+  reports %>%
+  group_by(Tau, Observer) %>%
+  mutate(cHistory = History - median(History, na.rm = TRUE))
+```
+  
+
+## Gamma model
+
+```{stan output.var="gamma_model"}
+data{
+  int<lower=1> rowN;          // number of rows in the table
+  int<lower=1> participantsN; // number of participants
+  int<lower=1> timescalesN;   // number of timescales
+
+  int<lower=1> iParticipant[rowN];  // participant 
+
+  real<lower=0> Duration[rowN]; // duration of the current percept
+  matrix[rowN, timescalesN] History; // history before current percept onset
+}
+parameters{
+  // --- intercepts, fully independent ---
+  vector[participantsN] aShape;
+  vector[participantsN] aScale;
+
+  // --- main effect of the history, hierarchical ---
+  // participants
+  row_vector[timescalesN] bShape_History[participantsN];
+  row_vector[timescalesN] bScale_History[participantsN];
+  
+  // group
+  vector[timescalesN] bShape_History_Mu;
+  vector<lower=0>[timescalesN] bShape_History_Sigma;
+  vector[timescalesN] bScale_History_Mu;
+  vector<lower=0>[timescalesN] bScale_History_Sigma;
+}
+transformed parameters{
+  vector<lower=0>[rowN] shape;
+  vector<lower=0>[rowN] scale;
+
+  for(iRow in 1:rowN){
+    shape[iRow] = exp(aShape[iParticipant[iRow]] + sum(bShape_History[iParticipant[iRow]] .* History[iRow]));
+    scale[iRow] = exp(aScale[iParticipant[iRow]] + sum(bScale_History[iParticipant[iRow]] .* History[iRow]));
+  }
+}
+model {
+  // --- intercepts, fully independent ---
+  aShape ~ normal(0, 10);
+  aScale ~ normal(0, 10);
+
+  // --- main effect of the history, population ---
+  bShape_History_Mu ~ normal(0.0, 1.0);
+  bShape_History_Sigma ~ cauchy(0, 10);
+  bScale_History_Mu ~ normal(0, 1);
+  bScale_History_Sigma ~ cauchy(0, 10);
+
+  // parameters for each timescale
+  for(iT in 1:timescalesN){
+    // main effect of history, participants
+    for(iP in 1:participantsN) {
+      // main effect of history
+      bShape_History[iP][iT] ~ normal(bShape_History_Mu[iT],
+                                      bShape_History_Sigma[iT]);
+      bScale_History[iP][iT] ~ normal(bScale_History_Mu[iT],
+                                      bScale_History_Sigma[iT]);
+     }
+  }
+
+  Duration ~ gamma(shape, inv(scale));
+}
+generated quantities{
+  vector[rowN] log_lik;
+  for (iRow in 1:rowN){
+    log_lik[iRow] = gamma_lpdf(Duration[iRow] | shape[iRow], inv(scale[iRow]));
+  }
+}
+```
+
+## Fitting model for every group
+
+Model is fitting for each group separately. Fits are save in "_Fits_" folder, posterior samples in "_Posterior samples_" folder.
+
+```{r}
+fit_display <- function(df){
+  # putting history per tau in a separate column
+  reports_wide <-
+    df %>%
+    mutate(Observer = as.factor(Observer), 
+           iObserver = as.integer(Observer)) %>%
+    dplyr::select(-History) %>%
+    tidyr::pivot_wider(names_from = Tau, values_from = cHistory) %>%
+    na.omit()
+  
+  # extracting history into separate matrix
+  history_matrix <-
+    reports_wide %>%
+    select_at((ncol(.)-length(taus)+1) : ncol(.)) %>%
+    as.matrix()
+  
+  data_for_stan <- list(
+    rowN = nrow(reports_wide),
+    participantsN = max(reports_wide$iObserver),
+    timescalesN = ncol(history_matrix),
+  
+    iParticipant = reports_wide$iObserver,
+    Participant = levels(reports_wide$Observer),
+  
+    Duration = reports_wide$Duration,
+    History = history_matrix,
+    
+    Tau = taus,
+    Group = reports_wide$Group[1]
+  )
+  
+  model_fit <- rstan::sampling(gamma_model,
+                               control=list(adapt_delta=0.98, max_treedepth=15),
+                               include=FALSE,
+                               pars=c("shape", "scale"),
+                               cores = future::availableCores(),
+                               data = data_for_stan)
+
+  save(model_fit, file = glue::glue("Fits/{reports_wide$Group[1]}.Rdata"))
+
+  posterior <- rstan::extract(model_fit)
+  save(posterior,
+       data_for_stan, 
+       file = glue::glue("Posterior samples/{reports_wide$Group[1]}.Rdata"))
+
+  get_bfmi(model_fit)
+
+  tibble(divergent=  rstan::get_num_divergent(model_fit),
+         max_treedepth =  rstan::get_num_max_treedepth(model_fit))
+}
+
+reports %>%
+  group_by(Group) %>%
+  do(fit_display(.))
+```
+
+

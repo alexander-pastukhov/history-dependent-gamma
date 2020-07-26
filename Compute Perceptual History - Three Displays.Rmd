@@ -1,0 +1,90 @@
+---
+title: "Cumulative history"
+author: "Alexander (Sasha) Pastukhov"
+date: "8 März 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(forcats)
+library(ggplot2)
+library(readr)
+library(Rcpp)
+library(lmerTest)
+library(tictoc)
+```
+
+```{r Blank initial state}
+rm(list= ls())
+```
+
+## Utilities
+```{r utilities}
+source("history_utils.R")
+```
+
+## Constants
+```{r constants}
+mixed_state <- -2
+mixed_value <- 0
+taus <- c(0.9, 30)
+```
+
+## Import and Preprocessing
+```{r Import data}
+reports <- 
+  read_csv("Data/3Displays.csv", 
+         col_types = cols(Observer = col_character(),
+                          Display = col_character(),
+                          Block = col_integer(),
+                          Time = col_double(),
+                          State = col_integer(),
+                          Duration = col_double())) %>%
+  
+  # renaming `Display` into `Group`
+  rename(Group = Display) %>%
+  
+  # converting state code from 1:-1 to 1:2 (allows direct indexing)
+  # -2 is still an unclear state
+  mutate(iState = as.factor(State),
+         iState = fct_relevel(iState, as.character(mixed_state), after=Inf),
+         iState = as.integer(iState)) %>%
+  
+  # readjusting duration based on rounded time (1 ms won't make much difference)
+  group_by(Observer, Group, Block) %>%
+  mutate(Time = round(Time)/1000,
+         Duration  = lead(Time) - Time) %>%
+  
+  # computing mean duration that will be used together with normalized tau
+  group_by(Observer, Group) %>%
+  mutate(IsClear = State != mixed_state, 
+         Tmean = mean(Duration[IsClear], na.rm=TRUE)) %>%
+  
+  # marking out durations eligible for the analysis
+  mutate(IsValid = IsClear) %>%
+  ungroup() %>%
+  mutate(iRow = 1:n())
+```
+
+## Computing history for the recent and distant past
+```{r recent past}
+reports_with_history <-
+  reports %>%
+  ungroup() %>%
+  group_by(Observer, Group, Block) %>%
+  do(computeHistory(., taus, length(levels(.$iState)), mixed_value))
+    
+simplified_reports <-
+  reports_with_history %>%
+  group_by(Observer, Group, Block, Tau) %>%
+  # slice(3:n()) %>%
+  ungroup () %>%
+  filter(State != mixed_state) %>%
+  select(Observer, Group, State, Time, Duration, HistorySame, HistoryOther, Tau, iRow)
+
+
+write_csv(simplified_reports, "Data with History/3Displays.csv")
+```

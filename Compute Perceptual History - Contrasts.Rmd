@@ -1,0 +1,78 @@
+---
+title: "BR Contrasts"
+author: "Alexander (Sasha) Pastukhov"
+date: "5 4 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(forcats)
+library(ggplot2)
+library(readr)
+library(Rcpp)
+```
+
+## Utilities
+```{r utilities}
+source("history_utils.R")
+```
+
+## Constants
+```{r constants}
+mixed_state <- -2
+mixed_value <- 0
+taus <- c(0.9, 30)
+```
+
+
+## Import
+
+```{r import}
+reports <- readr::read_csv("Data/Contrasts.csv",
+                           col_types = cols(Observer = col_character(),
+                                            Block = col_integer(),
+                                            Contrast = col_double(),
+                                            State = col_integer(),
+                                            Time = col_double(),
+                                            Duration = col_double()
+                                            )) %>%
+  group_by(Observer, Block) %>%
+  mutate(DTime = cumsum(Duration))
+```
+
+## Computing perceptual history
+
+```{r normalize}
+reports <-
+  reports %>%
+  ungroup() %>%
+  mutate(iState = as.factor(State),
+         iState = fct_relevel(iState, "-1", "1", "-2", after=Inf),
+         iState = as.integer(iState)) %>%
+  group_by(Observer, Contrast) %>%
+  mutate(Tmean = mean(Duration[State!=-2])) %>%
+  ungroup() %>%
+  mutate(iRow = 1:n())
+
+
+reports_with_history <-
+  reports %>%
+  ungroup() %>%
+  group_by(Observer, Contrast, Block) %>%
+  do(computeHistory(., taus, length(levels(.$iState)), mixed_value))  
+
+
+simplified_reports <-
+  reports_with_history %>%
+  group_by(Observer, Contrast, Block) %>%
+  slice(3:n()) %>%
+  ungroup () %>%
+  filter(State != mixed_state) %>%
+  select(Observer, Contrast, State, Time, Duration, HistorySame, HistoryOther, Tau, iRow)
+
+
+write_csv(simplified_reports, "Data with History/Contrasts.csv")
+```
